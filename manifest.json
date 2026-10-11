@@ -1,0 +1,32 @@
+{
+  "manifest_version": 3,
+  "name": "桌面歌词悬浮控制",
+  "plugin_id": "desktop-lyrics-hover-controls",
+  "version": "1.0.0",
+  "minversion": "1.7.0",
+  "moekoe": true,
+  "author": {
+    "name": "silex030",
+    "url": "https://github.com/silex030"
+  },
+  "description": "鼠标悬浮桌面歌词时显示上一曲、播放/暂停、下一曲和红心按钮，点击红心将当前歌曲加入我喜欢歌单。",
+  "content_scripts": [
+    {
+      "matches": [
+        "file:///*",
+        "http://localhost:8080/*",
+        "http://127.0.0.1:8080/*",
+        "https://app.testnet.music.moekoe.cn/*"
+      ],
+      "js": ["content.js"],
+      "css": ["styles.css"],
+      "run_at": "document_idle",
+      "world": "MAIN"
+    }
+  ],
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  }
+}
