@@ -115,6 +115,11 @@ test('real Electron desktop lyrics controls and native favorite request', { time
     let holdWrite = false;
     let releaseWrite;
     let switchOnQuery = false;
+    let queryHttpStatus = 200;
+    let malformedQuery = false;
+    let pauseQuery = false;
+    let pausedQueryId;
+    let loseWriteResponse = false;
     const songHash = 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA';
     const writeRequests = [];
     const queryPages = [];
@@ -128,10 +133,10 @@ test('real Electron desktop lyrics controls and native favorite request', { time
         { name: 'Access-Control-Allow-Credentials', value: 'true' },
         { name: 'Access-Control-Allow-Headers', value: 'Authorization, Content-Type' },
         { name: 'Access-Control-Allow-Methods', value: 'GET, OPTIONS' }];
-      async function fulfill(body) {
+      async function fulfill(body, responseCode = 200, rawBody = null) {
         await main.send('Fetch.fulfillRequest', { requestId: request.requestId,
-          responseCode: 200, responseHeaders: headers,
-          body: Buffer.from(JSON.stringify(body)).toString('base64') });
+          responseCode, responseHeaders: headers,
+          body: Buffer.from(rawBody ?? JSON.stringify(body)).toString('base64') });
       }
       if (request.request.method === 'OPTIONS') { await fulfill({}); return; }
       requests.push(url);
@@ -142,6 +147,11 @@ test('real Electron desktop lyrics controls and native favorite request', { time
           { name: '我喜欢', listid: userid === 111111 ? 888 : 777, list_create_userid: userid },
         ] } });
       } else if (url.pathname === '/playlist/track/all/new') {
+        if (pauseQuery) { pauseQuery = false; pausedQueryId = request.requestId; return; }
+        if (queryHttpStatus !== 200 || malformedQuery) {
+          await fulfill({}, queryHttpStatus, malformedQuery ? '<html>invalid API response</html>' : null);
+          return;
+        }
         queryPages.push(Number(url.searchParams.get('page')));
         if (switchOnQuery) {
           switchOnQuery = false;
@@ -155,6 +165,11 @@ test('real Electron desktop lyrics controls and native favorite request', { time
         writeRequests.push(url);
         if (holdWrite) { holdWrite = false; await new Promise(resolve => { releaseWrite = resolve; }); }
         if (!rejectWrite) serverLiked = url.pathname.endsWith('/add');
+        if (loseWriteResponse) {
+          loseWriteResponse = false;
+          await main.send('Fetch.failRequest', { requestId: request.requestId, errorReason: 'ConnectionReset' });
+          return;
+        }
         await fulfill({ status: rejectWrite ? 0 : 1, data: {} });
       }
     });
@@ -212,10 +227,48 @@ test('real Electron desktop lyrics controls and native favorite request', { time
     await t.test('HTTP 200 application failure does not falsely mark favorite successful', async () => {
       rejectWrite = true;
       await click('[data-mk-action="like"]');
-      await waitFor(() => lyrics.evaluate("document.querySelector('.mk-lyrics-status').textContent.includes('收藏操作失败')"), 'failed write feedback');
+      await waitFor(() => lyrics.evaluate("document.querySelector('.mk-lyrics-status').textContent.includes('服务未接受请求')"), 'failed write feedback');
       await favoriteReady(false);
       assert.equal(serverLiked, false);
       rejectWrite = false;
+    });
+
+    await t.test('expired login and malformed response have specific feedback', async () => {
+      const count = writeRequests.length;
+      queryHttpStatus = 401;
+      await fixture();
+      await waitFor(() => lyrics.evaluate("document.querySelector('[data-mk-action=like]').title.includes('重新登录')"), 'expired login feedback');
+      queryHttpStatus = 200;
+      malformedQuery = true;
+      await fixture();
+      await waitFor(() => lyrics.evaluate("document.querySelector('[data-mk-action=like]').title.includes('歌单数据异常')"), 'malformed response feedback');
+      assert.equal(writeRequests.length, count);
+      malformedQuery = false;
+      await fixture();
+      await favoriteReady(false);
+    });
+
+    await t.test('lost response after successful write is reconciled without repeating the toggle', async () => {
+      const count = writeRequests.length;
+      loseWriteResponse = true;
+      await click('[data-mk-action="like"]');
+      await waitFor(() => lyrics.evaluate("document.querySelector('.mk-lyrics-status').textContent.includes('结果待确认')"), 'uncertain result feedback');
+      await favoriteReady(true);
+      assert.equal(serverLiked, true);
+      assert.equal(writeRequests.length, count + 1, 'only read membership after an uncertain write');
+      await click('[data-mk-action="like"]');
+      await favoriteReady(false);
+    });
+
+    await t.test('actual request timeout disables the heart and reports timeout', async () => {
+      pauseQuery = true;
+      const count = writeRequests.length;
+      await fixture();
+      await waitFor(() => lyrics.evaluate("document.querySelector('[data-mk-action=like]').disabled && document.querySelector('[data-mk-action=like]').title.includes('请求超时')"), 'timeout feedback', 15000);
+      assert.equal(writeRequests.length, count);
+      try { await main.send('Fetch.failRequest', { requestId: pausedQueryId, errorReason: 'Aborted' }); } catch { /* already cancelled by fetch */ }
+      await fixture();
+      await favoriteReady(false);
     });
 
     await t.test('unknown membership and missing file ID cannot trigger unsafe playlist writes', async () => {
@@ -231,7 +284,7 @@ test('real Electron desktop lyrics controls and native favorite request', { time
       await fixture();
       await favoriteReady(true);
       await click('[data-mk-action="like"]');
-      await waitFor(() => lyrics.evaluate("document.querySelector('.mk-lyrics-status').textContent.includes('收藏操作失败')"), 'missing ID feedback');
+      await waitFor(() => lyrics.evaluate("document.querySelector('.mk-lyrics-status').textContent.includes('歌曲记录异常')"), 'missing ID feedback');
       await favoriteReady(true);
       assert.equal(writeRequests.length, count);
       missingFileId = false;

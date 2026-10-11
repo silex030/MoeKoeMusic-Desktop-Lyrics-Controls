@@ -80,6 +80,30 @@
     return { song, auth, listid, base, hash, key, accountKey, reason };
   }
 
+  class FavoriteError extends Error {
+    constructor(kind) { super(kind); this.kind = kind; }
+  }
+
+  function errorMessage(error, writing = false) {
+    const kind = error?.kind;
+    if (writing && ['timeout', 'network', 'format', 'service'].includes(kind)) {
+      return '收藏操作结果待确认，正在重新查询歌单';
+    }
+    const messages = {
+      auth: '登录可能已过期，请在播放器中重新登录',
+      forbidden: '当前账号没有歌单操作权限，请检查登录账号',
+      timeout: '请求超时，请稍后重试',
+      network: '无法连接服务，请检查网络及播放器 API 设置',
+      service: '服务暂时不可用，请稍后重试',
+      rejected: '服务未接受请求，请检查登录状态或稍后重试',
+      format: '歌单数据异常，请刷新歌单或检查 API 版本',
+      missingPlaylist: '未找到当前账号的「我喜欢」，请打开音乐库检查',
+      missingFileId: '无法取消收藏：歌曲记录异常，请刷新歌单后重试',
+      scanLimit: '歌单过大，暂时无法完整确认收藏状态',
+    };
+    return messages[kind] || '操作未完成，请稍后重试';
+  }
+
   async function api(ctx, path, params, signal) {
     const headers = { Accept: 'application/json' };
     const user = ctx.auth.UserInfo;
@@ -97,9 +121,21 @@
       for (const [key, value] of Object.entries(params)) url.searchParams.set(key, value);
       const response = await fetch(url, { headers, credentials: 'include',
         signal: signal ? AbortSignal.any([controller.signal, signal]) : controller.signal });
-      const data = await response.json();
-      if (!response.ok || Number(data?.status) !== 1) throw new Error('API rejected request');
+      if (response.status === 401) throw new FavoriteError('auth');
+      if (response.status === 403) throw new FavoriteError('forbidden');
+      if (!response.ok) throw new FavoriteError(response.status >= 500 ? 'service' : 'rejected');
+      let data;
+      try { data = await response.json(); }
+      catch (error) {
+        if (error.name === 'SyntaxError') throw new FavoriteError('format');
+        throw error;
+      }
+      if (Number(data?.status) !== 1) throw new FavoriteError('rejected');
       return data.data;
+    } catch (error) {
+      if (error instanceof FavoriteError) throw error;
+      if (controller.signal.aborted || signal?.aborted) throw new FavoriteError('timeout');
+      throw new FavoriteError('network');
     } finally { clearTimeout(timer); controllers.delete(controller); }
   }
 
@@ -107,7 +143,7 @@
     if (likePlaylist.key === ctx.accountKey && Date.now() - likePlaylist.at < 30000) return likePlaylist.id;
     for (let page = 1; page <= 100; page++) {
       const data = await api(ctx, '/user/playlist', { page, pagesize: 500 }, signal);
-      if (!Array.isArray(data?.info)) throw new Error('Unknown user playlist response');
+      if (!Array.isArray(data?.info)) throw new FavoriteError('format');
       const own = data.info.find(list => list.name === '我喜欢'
         && String(list.list_create_userid) === String(ctx.auth.UserInfo.userid));
       if (own && /^[1-9]\d*$/.test(String(own.listid))) {
@@ -117,7 +153,7 @@
       }
       if (data.info.length < 500) break;
     }
-    throw new Error('Own favorite playlist not found');
+    throw new FavoriteError('missingPlaylist');
   }
 
   async function findFavorite(ctx) {
@@ -129,17 +165,17 @@
     for (let page = 1; page <= 100; page++) {
       const data = await api(ctx, '/playlist/track/all/new', { listid: ctx.listid, page, pagesize: size }, deadline);
       const rows = Array.isArray(data?.info) ? data.info : data?.songs;
-      if (!Array.isArray(rows)) throw new Error('Unknown playlist response');
+      if (!Array.isArray(rows)) throw new FavoriteError('format');
       for (const row of rows) {
         const hashes = ['hash', 'filehash', 'FileHash', 'hash_128', 'hash_320', 'hash_flac', 'HQFileHash', 'SQFileHash']
           .map(key => row[key]).filter(value => typeof value === 'string').map(value => value.toLowerCase());
-        if (!hashes.length) throw new Error('Unknown playlist song format');
+        if (!hashes.length) throw new FavoriteError('format');
         if (hashes.includes(ctx.hash)) matches.push(row);
       }
       const count = Number(data?.count ?? data?.total ?? data?.list_info?.count);
       if (rows.length < size || (Number.isFinite(count) && count >= 0 && page * size >= count)) return matches;
     }
-    throw new Error('Playlist scan limit reached');
+    throw new FavoriteError('scanLimit');
   }
 
   function mainState() {
@@ -161,8 +197,9 @@
       try {
         const matches = await findFavorite(ctx);
         if (context().key === ctx.key) favorite = { key: ctx.key, liked: matches.length > 0, error: '', at: Date.now() };
-      } catch {
-        if (context().key === ctx.key) favorite = { key: ctx.key, liked: null, error: '收藏状态查询失败，稍后自动重试', at: Date.now() };
+      } catch (error) {
+        if (context().key === ctx.key) favorite = { key: ctx.key, liked: null,
+          error: `收藏状态查询失败：${errorMessage(error)}`, at: Date.now() };
       } finally { favoriteTask = null; post('state', mainState()); }
     })();
     post('state', mainState());
@@ -178,6 +215,7 @@
     }
     toggleBusy = true;
     post('state', mainState());
+    let writing = false;
     try {
       // Re-read server membership before every write, including changes made elsewhere.
       if (favoriteTask) await favoriteTask;
@@ -186,17 +224,19 @@
       const remove = matches.length > 0;
       if (remove) {
         const ids = [...new Set(matches.map(row => String(row.fileid ?? '')))];
-        if (ids.some(id => !/^[1-9]\d*$/.test(id))) throw new Error('Missing playlist file ID');
+        if (ids.some(id => !/^[1-9]\d*$/.test(id))) throw new FavoriteError('missingFileId');
+        writing = true;
         await api(ctx, '/playlist/tracks/del', { listid: ctx.listid, fileids: ids.join(',') });
       } else {
         const name = typeof ctx.song.name === 'string' ? ctx.song.name.replace(/,/g, '') : '';
+        writing = true;
         await api(ctx, '/playlist/tracks/add', { listid: ctx.listid, data: `${name}|${ctx.song.hash}` });
       }
       if (context().key === ctx.key) favorite = { key: ctx.key, liked: !remove, error: '', at: Date.now() };
       post('like-result', { ...result, ok: true, message: remove ? '已取消收藏' : '已加入我喜欢' });
-    } catch {
+    } catch (error) {
       if (context().key === ctx.key) favorite = { key: ctx.key, liked: null, error: '收藏操作失败，正在重新确认状态', at: 0 };
-      post('like-result', { ...result, ok: false, message: context().key !== ctx.key ? '歌曲或账号已切换，请重试' : '收藏操作失败，请检查网络或登录状态' });
+      post('like-result', { ...result, ok: false, message: context().key !== ctx.key ? '歌曲或账号已切换，请重试' : errorMessage(error, writing) });
     } finally { toggleBusy = false; post('state', mainState()); if (!destroyed) refreshFavorite(); }
   }
 
