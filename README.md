@@ -41,6 +41,8 @@ python3 scripts/package.py
 
 集成测试使用 Node.js 22+ 自带的 WebSocket，连接运行中的 MoeKoe Music Electron 调试端口 9222。应在测试专用的播放器资料目录中执行：测试会临时设置测试歌曲和账号状态，随后恢复页面存储，并拦截收藏接口以避免写入真实歌单。
 
+目前测试针对 Linux 的 Xvfb 环境，需要 Python 3、libX11 和 libXtst。启动播放器的 `xvfb-run` 进程 PID 应记录在服务状态 JSON 的 `electron.pid` 中，通过 `MOEKOE_SERVICE_STATE` 指定该文件；默认读取云环境的 `/workspace/.moekoe-environment/runtime/services.json`。测试只控制这个进程启动的 Xvfb，找不到时会停止。开发页面应使用 `http://localhost:8080`，API 使用 `http://127.0.0.1:6521`；可通过 `MOEKOE_DEBUG_PORT` 指定调试端口。
+
 ```sh
 python3 scripts/package.py
 npm test
