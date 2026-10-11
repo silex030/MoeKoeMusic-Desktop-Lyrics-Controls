@@ -21,7 +21,13 @@
   let stateTimer = null;
   let likeTimer = null;
   let likeRequest = null;
-  let lastLikeAt = 0;
+  let liked = null;
+  let trackKey = '';
+  let toggleBusy = false;
+  let favoriteTask = null;
+  let favorite = { key: '', liked: null, error: '', at: 0 };
+  let likePlaylist = { key: '', id: '', at: 0 };
+  const controllers = new Set();
   let playing = false;
   let canLike = false;
   let likeReason = '正在连接播放器';
@@ -51,56 +57,154 @@
     catch { return null; }
   }
 
-  function mainState() {
+  function context() {
     const song = readStored('current_song');
+    const auth = readStored('MoeData');
+    const listid = localStorage.getItem('like');
+    const settings = readStored('settings');
+    let base = settings?.apiBaseUrl || 'http://127.0.0.1:6521';
     let reason = '';
+    try {
+      const url = new URL(base);
+      if (!['http:', 'https:'].includes(url.protocol)) throw new Error();
+      base = base.replace(/\/+$/, '');
+    } catch { reason = '播放器 API 地址无效'; }
     if (!song?.hash) reason = '暂无正在播放的歌曲';
-    else if (song.isLocal) reason = '本地音乐不支持加入我喜欢';
-    else if (song.isCloud) reason = '云盘音乐不支持加入我喜欢';
-    return {
-      playing: Boolean(document.querySelector('.player-container .controls .fa-pause')),
-      canLike: !reason,
-      reason,
-    };
+    else if (song.isLocal) reason = '本地音乐不支持收藏';
+    else if (song.isCloud) reason = '云盘音乐不支持收藏';
+    else if (!auth?.UserInfo?.userid) reason = '请先在播放器中登录';
+    const hash = typeof song?.hash === 'string' ? song.hash.toLowerCase() : '';
+    // This key stays in the main window; authentication is never broadcast.
+    const accountKey = JSON.stringify([auth?.UserInfo?.userid, auth?.UserInfo?.token, base]);
+    const key = JSON.stringify([hash, accountKey]);
+    return { song, auth, listid, base, hash, key, accountKey, reason };
   }
 
-  function requestLike(message) {
-    if (!document.querySelector('.player-container')) return;
-    const result = { clientId: message.clientId, requestId: message.requestId };
-    const state = mainState();
-    if (!state.canLike) {
-      post('like-result', { ...result, ok: false, message: state.reason });
+  async function api(ctx, path, params, signal) {
+    const headers = { Accept: 'application/json' };
+    const user = ctx.auth.UserInfo;
+    const device = ctx.auth.Device;
+    const fields = { token: user.token, userid: user.userid, t1: user.t1,
+      dfid: device?.dfid, KUGOU_API_MID: device?.mid, KUGOU_API_GUID: device?.guid,
+      KUGOU_API_DEV: device?.serverDev, KUGOU_API_MAC: device?.mac };
+    const auth = Object.entries(fields).filter(([, value]) => value).map(([key, value]) => `${key}=${value}`).join(';');
+    if (auth) headers.Authorization = auth;
+    const controller = new AbortController();
+    controllers.add(controller);
+    const timer = setTimeout(() => controller.abort(), 10000);
+    try {
+      const url = new URL(`${ctx.base}${path}`);
+      for (const [key, value] of Object.entries(params)) url.searchParams.set(key, value);
+      const response = await fetch(url, { headers, credentials: 'include',
+        signal: signal ? AbortSignal.any([controller.signal, signal]) : controller.signal });
+      const data = await response.json();
+      if (!response.ok || Number(data?.status) !== 1) throw new Error('API rejected request');
+      return data.data;
+    } finally { clearTimeout(timer); controllers.delete(controller); }
+  }
+
+  async function ownLikePlaylist(ctx, signal) {
+    if (likePlaylist.key === ctx.accountKey && Date.now() - likePlaylist.at < 30000) return likePlaylist.id;
+    for (let page = 1; page <= 100; page++) {
+      const data = await api(ctx, '/user/playlist', { page, pagesize: 500 }, signal);
+      if (!Array.isArray(data?.info)) throw new Error('Unknown user playlist response');
+      const own = data.info.find(list => list.name === '我喜欢'
+        && String(list.list_create_userid) === String(ctx.auth.UserInfo.userid));
+      if (own && /^[1-9]\d*$/.test(String(own.listid))) {
+        const id = String(own.listid);
+        if (context().accountKey === ctx.accountKey) likePlaylist = { key: ctx.accountKey, id, at: Date.now() };
+        return id;
+      }
+      if (data.info.length < 500) break;
+    }
+    throw new Error('Own favorite playlist not found');
+  }
+
+  async function findFavorite(ctx) {
+    const matches = [];
+    const deadline = AbortSignal.timeout(15000);
+    // Resolve ownership instead of trusting a cached ID left by a previous account.
+    ctx.listid = await ownLikePlaylist(ctx, deadline);
+    const size = 200;
+    for (let page = 1; page <= 100; page++) {
+      const data = await api(ctx, '/playlist/track/all/new', { listid: ctx.listid, page, pagesize: size }, deadline);
+      const rows = Array.isArray(data?.info) ? data.info : data?.songs;
+      if (!Array.isArray(rows)) throw new Error('Unknown playlist response');
+      for (const row of rows) {
+        const hashes = ['hash', 'filehash', 'FileHash', 'hash_128', 'hash_320', 'hash_flac', 'HQFileHash', 'SQFileHash']
+          .map(key => row[key]).filter(value => typeof value === 'string').map(value => value.toLowerCase());
+        if (!hashes.length) throw new Error('Unknown playlist song format');
+        if (hashes.includes(ctx.hash)) matches.push(row);
+      }
+      const count = Number(data?.count ?? data?.total ?? data?.list_info?.count);
+      if (rows.length < size || (Number.isFinite(count) && count >= 0 && page * size >= count)) return matches;
+    }
+    throw new Error('Playlist scan limit reached');
+  }
+
+  function mainState() {
+    const ctx = context();
+    const current = favorite.key === ctx.key;
+    const reason = ctx.reason || (toggleBusy ? '正在更新收藏' : favoriteTask ? '正在确认收藏状态' :
+      current && favorite.error ? favorite.error : !current || favorite.liked === null ? '正在确认收藏状态' : '');
+    return { playing: Boolean(document.querySelector('.player-container .controls .fa-pause')),
+      trackKey: ctx.hash, liked: current ? favorite.liked : null, canLike: !reason, reason };
+  }
+
+  function refreshFavorite(force = false) {
+    const ctx = context();
+    if (ctx.reason) { favorite = { key: ctx.key, liked: null, error: '', at: 0 }; post('state', mainState()); return Promise.resolve(); }
+    if (favoriteTask) return favoriteTask;
+    if (!force && favorite.key === ctx.key && Date.now() - favorite.at < (favorite.error ? 5000 : 30000)) return Promise.resolve();
+    if (favorite.key !== ctx.key) favorite = { key: ctx.key, liked: null, error: '', at: 0 };
+    favoriteTask = (async () => {
+      try {
+        const matches = await findFavorite(ctx);
+        if (context().key === ctx.key) favorite = { key: ctx.key, liked: matches.length > 0, error: '', at: Date.now() };
+      } catch {
+        if (context().key === ctx.key) favorite = { key: ctx.key, liked: null, error: '收藏状态查询失败，稍后自动重试', at: Date.now() };
+      } finally { favoriteTask = null; post('state', mainState()); }
+    })();
+    post('state', mainState());
+    return favoriteTask;
+  }
+
+  async function requestLike(message) {
+    const ctx = context();
+    const result = { clientId: message.clientId, requestId: message.requestId, trackKey: ctx.hash };
+    if (ctx.reason || message.trackKey !== ctx.hash || toggleBusy) {
+      post('like-result', { ...result, ok: false, message: ctx.reason || '歌曲已切换或收藏操作正在进行，请稍后重试' });
       return;
     }
-    if (!readStored('MoeData')?.UserInfo) {
-      post('like-result', { ...result, ok: false, message: '请先在播放器中登录' });
-      return;
-    }
-    if (!localStorage.getItem('like')) {
-      post('like-result', { ...result, ok: false, message: '请先打开音乐库，加载「我喜欢」歌单' });
-      return;
-    }
-    const button = document.querySelector('.player-container .player-bar .extra-controls .fa-heart')?.closest('button');
-    if (!button || button.disabled) {
-      post('like-result', { ...result, ok: false, message: '播放器的收藏按钮暂不可用' });
-      return;
-    }
-    if (Date.now() - lastLikeAt < 1000) {
-      post('like-result', { ...result, ok: false, message: '收藏请求已发送，请稍候' });
-      return;
-    }
-    lastLikeAt = Date.now();
-    // Use the host's own validation, current track, authentication, and playlist API.
-    // A dispatched click is not confirmation that a remote playlist write succeeded.
-    button.click();
-    post('like-result', { ...result, ok: true, message: '已发送收藏请求，请留意播放器提示' });
+    toggleBusy = true;
+    post('state', mainState());
+    try {
+      // Re-read server membership before every write, including changes made elsewhere.
+      if (favoriteTask) await favoriteTask;
+      const matches = await findFavorite(ctx);
+      if (destroyed || context().key !== ctx.key) throw new Error('context changed');
+      const remove = matches.length > 0;
+      if (remove) {
+        const ids = [...new Set(matches.map(row => String(row.fileid ?? '')))];
+        if (ids.some(id => !/^[1-9]\d*$/.test(id))) throw new Error('Missing playlist file ID');
+        await api(ctx, '/playlist/tracks/del', { listid: ctx.listid, fileids: ids.join(',') });
+      } else {
+        const name = typeof ctx.song.name === 'string' ? ctx.song.name.replace(/,/g, '') : '';
+        await api(ctx, '/playlist/tracks/add', { listid: ctx.listid, data: `${name}|${ctx.song.hash}` });
+      }
+      if (context().key === ctx.key) favorite = { key: ctx.key, liked: !remove, error: '', at: Date.now() };
+      post('like-result', { ...result, ok: true, message: remove ? '已取消收藏' : '已加入我喜欢' });
+    } catch {
+      if (context().key === ctx.key) favorite = { key: ctx.key, liked: null, error: '收藏操作失败，正在重新确认状态', at: 0 };
+      post('like-result', { ...result, ok: false, message: context().key !== ctx.key ? '歌曲或账号已切换，请重试' : '收藏操作失败，请检查网络或登录状态' });
+    } finally { toggleBusy = false; post('state', mainState()); if (!destroyed) refreshFavorite(); }
   }
 
   function onMessage(event) {
     const message = event.data;
     if (!message || message.source !== SOURCE || typeof message.type !== 'string') return;
     if (role === 'main') {
-      if (message.type === 'state-request') post('state', mainState());
+      if (message.type === 'state-request') { post('state', mainState()); if (!toggleBusy) refreshFavorite(); }
       if (message.type === 'like' && typeof message.clientId === 'string'
           && typeof message.requestId === 'string' && message.clientId.length <= 64
           && message.requestId.length <= 64) requestLike(message);
@@ -109,13 +213,15 @@
     if (role !== 'lyrics') return;
     if (message.type === 'state') {
       if (typeof message.playing === 'boolean') playing = message.playing;
+      trackKey = typeof message.trackKey === 'string' ? message.trackKey : '';
+      liked = typeof message.liked === 'boolean' ? message.liked : null;
       canLike = message.canLike === true;
       likeReason = typeof message.reason === 'string' ? message.reason : '';
       updateButtons();
     } else if (message.type === 'like-result' && message.clientId === clientId
                && message.requestId === likeRequest) {
       clearTimeout(likeTimer);
-      showStatus(typeof message.message === 'string' ? message.message : '请查看播放器的收藏结果');
+      if (message.trackKey === trackKey) showStatus(typeof message.message === 'string' ? message.message : '请查看收藏结果');
       likeTimer = setTimeout(() => { likeRequest = null; updateButtons(); }, 1000);
     }
   }
@@ -137,12 +243,13 @@
       if (likeRequest) return;
       likeRequest = crypto.randomUUID();
       updateButtons();
-      post('like', { clientId, requestId: likeRequest });
+      showStatus(liked ? '正在取消收藏…' : '正在加入我喜欢…');
+      post('like', { clientId, requestId: likeRequest, trackKey });
       likeTimer = setTimeout(() => {
         likeRequest = null;
         showStatus('播放器未响应，请打开主窗口后重试');
         updateButtons();
-      }, 4000);
+      }, 40000);
       return;
     }
     const hostAction = { previous: 'previous-song', next: 'next-song', play: 'toggle-play' }[action];
@@ -158,7 +265,9 @@
     play.setAttribute('aria-label', label);
     const like = toolbar.querySelector('[data-mk-action="like"]');
     like.disabled = !canLike || Boolean(likeRequest);
-    like.title = likeRequest ? '正在发送收藏请求' : canLike ? '加入我喜欢' : likeReason;
+    like.dataset.liked = liked === null ? 'unknown' : String(liked);
+    like.setAttribute('aria-pressed', String(liked === true));
+    like.title = likeRequest ? '正在更新收藏' : canLike ? liked ? '取消收藏' : '加入我喜欢' : likeReason;
     like.setAttribute('aria-label', like.title);
     like.setAttribute('aria-busy', String(Boolean(likeRequest)));
   }
@@ -231,6 +340,7 @@
     clearTimeout(statusTimer);
     clearTimeout(likeTimer);
     for (const [name, callback] of listening) ipc.removeListener(name, callback);
+    for (const controller of controllers) controller.abort();
     channel.close();
     toolbar?.remove();
     for (const element of document.querySelectorAll(`[${NATIVE_ATTRIBUTE}]`)) element.removeAttribute(NATIVE_ATTRIBUTE);

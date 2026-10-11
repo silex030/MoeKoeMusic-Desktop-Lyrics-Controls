@@ -1,6 +1,6 @@
 {
   "name": "moekoe-desktop-lyrics-hover-controls",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "private": true,
   "type": "module",
   "description": "MoeKoe Music 桌面歌词悬浮播放与收藏控制插件",

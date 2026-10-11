@@ -76,8 +76,12 @@ html[data-mk-lyrics-hover-controls="active"] [data-mk-action="like"]:not(:disabl
 }
 
 html[data-mk-lyrics-hover-controls="active"] .mk-heart-icon {
-  fill: currentColor;
+  fill: none;
   stroke-width: 1;
+}
+
+html[data-mk-lyrics-hover-controls="active"] [data-mk-action="like"][data-liked="true"] .mk-heart-icon {
+  fill: currentColor;
 }
 
 html[data-mk-lyrics-hover-controls="active"] .mk-lyrics-status {
